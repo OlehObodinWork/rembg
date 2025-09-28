@@ -12,4 +12,10 @@ services:
       replicas: ${REPLICAS_COUNT:-1}
     ports:
       - ${PUBLIC_PORT:-7000:7000}
+    volumes:
+        - type: bind
+          source: .
+          target: /app
+
+
 version: '3'

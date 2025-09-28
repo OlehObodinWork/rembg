@@ -3,6 +3,12 @@ import os
 import webbrowser
 from typing import Optional, Tuple, cast
 
+import requests
+import base64
+import hashlib
+from urllib.parse import urlparse
+
+
 import aiohttp
 import click
 import gradio as gr
@@ -214,6 +220,120 @@ def s_command(port: int, host: str, log_level: str, threads: int) -> None:
             ),
             media_type="image/png",
         )
+    
+    def im_without_bg_upload(content: bytes, url:str, commons: CommonQueryParams) -> Response:
+        kwargs = {}
+
+        image = remove(
+            content,
+            session=sessions.setdefault(
+                commons.model, new_session(commons.model, **kwargs)
+            ),
+            alpha_matting=commons.a,
+            alpha_matting_foreground_threshold=commons.af,
+            alpha_matting_background_threshold=commons.ab,
+            alpha_matting_erode_size=commons.ae,
+            only_mask=commons.om,
+            post_process_mask=commons.ppm,
+            bgcolor=commons.bgc,
+            **kwargs,
+        )
+
+        backblaze_key_id = "003a9033de3065d0000000001"
+        backbalze_key_name = "Rembg"
+        backblaze_key = "K003bjLM3VerNPQ2iwMzzhR2vk+5AFk"
+        url_api = "https://api.backblazeb2.com/b2api/v4/b2_authorize_account"
+        BUCKET_ID = "9af96013534d9e039096051d"
+        
+        parsed_url = urlparse(url)
+        image_name = os.path.basename(parsed_url.path)
+
+        encoded_auth = base64.b64encode(f"{backblaze_key_id}:{backblaze_key}".encode()).decode()
+        headers = {
+            "Authorization": f"Basic {encoded_auth}",
+            "Content-Type": "application/json"
+        }
+
+        response = requests.get(url_api, headers=headers)
+        print("----------------- auth -------------------------")
+        print("----------------- auth -------------------------")
+        print("----------------- auth -------------------------")
+        print(response.json())
+
+        token = response.json().get("authorizationToken")
+        api_url =response.json()["apiInfo"]["storageApi"]["apiUrl"] + "/b2api/v4/b2_get_upload_url"
+
+        headers = {
+            "Authorization": token,
+            "Content-Type": "application/json",
+
+        }
+        data = {
+            "bucketId": BUCKET_ID
+        }
+
+        print("-----------------api_url-------------------------")
+        print(api_url)
+        print("-----------------api_url-------------------------")
+       
+
+        response = requests.get(api_url, headers=headers, params=data)
+        print("-----------------get upload url-------------------------")
+        print("-----------------get upload url-------------------------")
+        print("-----------------get upload url-------------------------")
+        print(response.json())
+        token = response.json().get("authorizationToken")
+        api_url = response.json().get("uploadUrl")
+
+        headers ={
+            "Authorization": token,
+            "X-Bz-File-Name": f"{image_name}",
+            "Content-Type": "b2/x-auto",
+            "Content-Length": str(len(image)),
+            "X-Bz-Content-Sha1": hashlib.sha1(image).hexdigest(),
+        }
+
+        
+        # files = {
+        #     "image": (f"{image_name}", image, "image/png")
+        # }
+
+        response = requests.post(api_url, headers=headers, data=image)
+
+        print("-----------------uploaded-------------------------")
+        print("-----------------uploaded-------------------------")
+        print("-----------------uploaded-------------------------")
+        print(response.json())
+
+        if commons.extras:
+            try:
+                kwargs.update(json.loads(commons.extras))
+            except Exception:
+                pass
+
+       
+        return Response(
+            remove(
+                content,
+                session=sessions.setdefault(
+                    commons.model, new_session(commons.model, **kwargs)
+                ),
+                alpha_matting=commons.a,
+                alpha_matting_foreground_threshold=commons.af,
+                alpha_matting_background_threshold=commons.ab,
+                alpha_matting_erode_size=commons.ae,
+                only_mask=commons.om,
+                post_process_mask=commons.ppm,
+                bgcolor=commons.bgc,
+                **kwargs,
+            ),
+            media_type="image/png",
+        )
+
+
+        
+
+
 
     @app.on_event("startup")
     def startup():
@@ -244,6 +364,23 @@ def s_command(port: int, host: str, log_level: str, threads: int) -> None:
             async with session.get(url) as response:
                 file = await response.read()
                 return await asyncify(im_without_bg)(file, commons)
+            
+    @app.get(
+        path="/api/remove_upload",
+        tags=["Background Removal Upload"],
+        summary="Remove from URL and upload to backblaze",
+        description="Removes the background from an image obtained by retrieving an URL and upload to backblaze.",
+    )
+    async def get_index_upload(
+        url: str = Query(
+            default=..., description="URL of the image that has to be processed."
+        ),
+        commons: CommonQueryParams = Depends(),
+    ):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                file = await response.read()
+                return await asyncify(im_without_bg_upload)(file, url, commons)
 
     @app.post(
         path="/api/remove",
@@ -259,6 +396,11 @@ def s_command(port: int, host: str, log_level: str, threads: int) -> None:
         commons: CommonQueryPostParams = Depends(),
     ):
         return await asyncify(im_without_bg)(file, commons)  # type: ignore
+    
+    @app.get("/my-endpoint")
+    def read_data():
+        return {"message": "Hello"}
+
 
     def gr_app(app):
         def inference(input_path, model, *args):
