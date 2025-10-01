@@ -1,5 +1,6 @@
 import io
 import sys
+
 from enum import Enum
 from typing import Any, List, Optional, Tuple, Union, cast
 
@@ -9,11 +10,14 @@ from cv2 import (
     BORDER_DEFAULT,
     MORPH_ELLIPSE,
     MORPH_OPEN,
+    INPAINT_TELEA,
     GaussianBlur,
     getStructuringElement,
     morphologyEx,
+    inpaint,
+    erode
 )
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 from PIL.Image import Image as PILImage
 from pymatting.alpha.estimate_alpha_cf import estimate_alpha_cf
 from pymatting.foreground.estimate_foreground_ml import estimate_foreground_ml
@@ -216,61 +220,45 @@ def download_models(models: tuple[str, ...]) -> None:
                 print(f"Error downloading model: {e}")
 
 
+
+# --- Core background removal ---
+
 def remove(
-    data: Union[bytes, PILImage, np.ndarray],
+    data: Union[bytes, Image.Image, np.ndarray],
     alpha_matting: bool = False,
     alpha_matting_foreground_threshold: int = 240,
     alpha_matting_background_threshold: int = 10,
-    alpha_matting_erode_size: int = 10,
-    session: Optional[BaseSession] = None,
+    alpha_matting_erode_size: int = 20,
+    session: Optional["BaseSession"] = None,
     only_mask: bool = False,
-    post_process_mask: bool = False,
+    post_process_mask: bool = True,
     bgcolor: Optional[Tuple[int, int, int, int]] = None,
     force_return_bytes: bool = False,
     *args: Optional[Any],
     **kwargs: Optional[Any],
-) -> Union[bytes, PILImage, np.ndarray]:
+) -> Union[bytes, Image.Image, np.ndarray]:
     """
-    Remove the background from an input image.
-
-    This function takes in various parameters and returns a modified version of the input image with the background removed. The function can handle input data in the form of bytes, a PIL image, or a numpy array. The function first checks the type of the input data and converts it to a PIL image if necessary. It then fixes the orientation of the image and proceeds to perform background removal using the 'u2net' model. The result is a list of binary masks representing the foreground objects in the image. These masks are post-processed and combined to create a final cutout image. If a background color is provided, it is applied to the cutout image. The function returns the resulting cutout image in the format specified by the input 'return_type' parameter or as python bytes if force_return_bytes is true.
-
-    Parameters:
-        data (Union[bytes, PILImage, np.ndarray]): The input image data.
-        alpha_matting (bool, optional): Flag indicating whether to use alpha matting. Defaults to False.
-        alpha_matting_foreground_threshold (int, optional): Foreground threshold for alpha matting. Defaults to 240.
-        alpha_matting_background_threshold (int, optional): Background threshold for alpha matting. Defaults to 10.
-        alpha_matting_erode_size (int, optional): Erosion size for alpha matting. Defaults to 10.
-        session (Optional[BaseSession], optional): A session object for the 'u2net' model. Defaults to None.
-        only_mask (bool, optional): Flag indicating whether to return only the binary masks. Defaults to False.
-        post_process_mask (bool, optional): Flag indicating whether to post-process the masks. Defaults to False.
-        bgcolor (Optional[Tuple[int, int, int, int]], optional): Background color for the cutout image. Defaults to None.
-        force_return_bytes (bool, optional): Flag indicating whether to return the cutout image as bytes. Defaults to False.
-        *args (Optional[Any]): Additional positional arguments.
-        **kwargs (Optional[Any]): Additional keyword arguments.
-
-    Returns:
-        Union[bytes, PILImage, np.ndarray]: The cutout image with the background removed.
+    Remove the background from an input image using u2net.
+    Returns a cutout with transparent background or applied bgcolor.
     """
     if isinstance(data, bytes) or force_return_bytes:
         return_type = ReturnType.BYTES
-        img = cast(PILImage, Image.open(io.BytesIO(cast(bytes, data))))
-    elif isinstance(data, PILImage):
+        img = cast(Image.Image, Image.open(io.BytesIO(cast(bytes, data))))
+    elif isinstance(data, Image.Image):
         return_type = ReturnType.PILLOW
-        img = cast(PILImage, data)
+        img = cast(Image.Image, data)
     elif isinstance(data, np.ndarray):
         return_type = ReturnType.NDARRAY
-        img = cast(PILImage, Image.fromarray(data))
+        img = cast(Image.Image, Image.fromarray(data))
     else:
         raise ValueError(
-            "Input type {} is not supported. Try using force_return_bytes=True to force python bytes output".format(
-                type(data)
-            )
+            f"Input type {type(data)} is not supported. "
+            "Try using force_return_bytes=True to force python bytes output"
         )
 
     putalpha = kwargs.pop("putalpha", False)
 
-    # Fix image orientation
+    # Fix orientation
     img = fix_image_orientation(img)
 
     if session is None:
@@ -285,7 +273,6 @@ def remove(
 
         if only_mask:
             cutout = mask
-
         elif alpha_matting:
             try:
                 cutout = alpha_matting_cutout(
@@ -296,33 +283,60 @@ def remove(
                     alpha_matting_erode_size,
                 )
             except ValueError:
-                if putalpha:
-                    cutout = putalpha_cutout(img, mask)
-                else:
-                    cutout = naive_cutout(img, mask)
+                cutout = putalpha_cutout(img, mask) if putalpha else naive_cutout(img, mask)
         else:
-            if putalpha:
-                cutout = putalpha_cutout(img, mask)
-            else:
-                cutout = naive_cutout(img, mask)
+            cutout = putalpha_cutout(img, mask) if putalpha else naive_cutout(img, mask)
 
         cutouts.append(cutout)
 
     cutout = img
-    if len(cutouts) > 0:
+    if cutouts:
         cutout = get_concat_v_multi(cutouts)
 
     if bgcolor is not None and not only_mask:
         cutout = apply_background_color(cutout, bgcolor)
 
-    if ReturnType.PILLOW == return_type:
+    if return_type == ReturnType.PILLOW:
         return cutout
-
-    if ReturnType.NDARRAY == return_type:
+    if return_type == ReturnType.NDARRAY:
         return np.asarray(cutout)
 
     bio = io.BytesIO()
     cutout.save(bio, "PNG")
     bio.seek(0)
-
     return bio.read()
+
+
+def finalize_alpha(image_bytes: bytes, alpha_threshold: int = 10) -> bytes:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    arr = np.array(img).astype(np.uint8)
+
+    rgb = arr[:, :, :3].copy()
+    alpha = arr[:, :, 3].copy()
+
+    # 1. Threshold faint alpha
+    alpha[alpha < alpha_threshold] = 0
+
+    # 2. Erode then feather
+    kernel = np.ones((3, 3), np.uint8)
+    alpha = erode(alpha, kernel, iterations=1)
+    alpha = GaussianBlur(alpha, (5, 5), 0)
+
+    # 3. Premultiply
+    alpha_f = alpha.astype(np.float32) / 255.0
+    rgb = (rgb.astype(np.float32) * alpha_f[..., None]).astype(np.uint8)
+
+    # 4. Two-pass inpainting
+    hard_mask = (alpha == 0).astype(np.uint8) * 255
+    soft_mask = (alpha < (alpha_threshold * 4)).astype(np.uint8) * 255
+    for c in range(3):
+        rgb[:, :, c] = inpaint(rgb[:, :, c], hard_mask, 3, INPAINT_TELEA)
+        rgb[:, :, c] = inpaint(rgb[:, :, c], soft_mask, 3, INPAINT_TELEA)
+
+    # Recombine
+    out = np.dstack([rgb, alpha])
+    img_out = Image.fromarray(out, "RGBA")
+
+    buf = io.BytesIO()
+    img_out.save(buf, format="PNG")
+    return buf.getvalue()

@@ -3,6 +3,12 @@ import os
 import webbrowser
 from typing import Optional, Tuple, cast
 
+import requests
+import base64
+import hashlib
+from urllib.parse import urlparse
+
+
 import aiohttp
 import click
 import gradio as gr
@@ -13,11 +19,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
 from .._version import get_versions
-from ..bg import remove
+from ..bg import remove, finalize_alpha
 from ..session_factory import new_session
 from ..sessions import sessions_names
 from ..sessions.base import BaseSession
 
+from ..backblaze_upload import *
 
 @click.command(  # type: ignore
     name="s",
@@ -214,6 +221,47 @@ def s_command(port: int, host: str, log_level: str, threads: int) -> None:
             ),
             media_type="image/png",
         )
+    
+    async def im_without_bg_upload(content: bytes, url:str, commons: CommonQueryParams) -> Response:
+        kwargs = {}
+
+        image_name = get_image_name(url)
+
+        image = remove(
+            content,
+            session=sessions.setdefault(
+                commons.model, new_session(commons.model, **kwargs)
+            ),
+            alpha_matting=commons.a,
+            alpha_matting_foreground_threshold=commons.af,
+            alpha_matting_background_threshold=commons.ab,
+            alpha_matting_erode_size=commons.ae,
+            only_mask=commons.om,
+            post_process_mask=commons.ppm,
+            bgcolor=commons.bgc,
+            **kwargs,
+        )
+        image = finalize_alpha(image)
+
+
+        # Backblaze upload
+        auth = await authorize_backblaze()
+        upload_data = await get_upload_url(auth["api_url"], auth["token"])
+        await upload_image(upload_data["upload_url"], upload_data["token"], image, image_name)
+      
+        if commons.extras:
+            try:
+                kwargs.update(json.loads(commons.extras))
+            except Exception:
+                pass
+
+       
+        return Response(
+            image,
+            media_type="image/png",
+        )
+
+        
 
     @app.on_event("startup")
     def startup():
@@ -244,6 +292,23 @@ def s_command(port: int, host: str, log_level: str, threads: int) -> None:
             async with session.get(url) as response:
                 file = await response.read()
                 return await asyncify(im_without_bg)(file, commons)
+            
+    @app.get(
+        path="/api/remove_upload",
+        tags=["Background Removal Upload"],
+        summary="Remove from URL and upload to backblaze",
+        description="Removes the background from an image obtained by retrieving an URL and upload to backblaze.",
+    )
+    async def get_index_upload(
+        url: str = Query(
+            default=..., description="URL of the image that has to be processed."
+        ),
+        commons: CommonQueryParams = Depends(),
+    ):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                file = await response.read()
+                return await im_without_bg_upload(file, url, commons)
 
     @app.post(
         path="/api/remove",
@@ -259,6 +324,11 @@ def s_command(port: int, host: str, log_level: str, threads: int) -> None:
         commons: CommonQueryPostParams = Depends(),
     ):
         return await asyncify(im_without_bg)(file, commons)  # type: ignore
+    
+    @app.get("/my-endpoint")
+    def read_data():
+        return {"message": "Hello"}
+
 
     def gr_app(app):
         def inference(input_path, model, *args):
